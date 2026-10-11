@@ -4,7 +4,9 @@
 
 - **应用地址**：https://lqlxhwjm1129-ops.github.io/physics-tiku/
 - **网页产物仓库**：https://github.com/lqlxhwjm1129-ops/physics-tiku
-- **安装包下载**：见本仓库的 [Releases](../../releases)
+- **安装包下载**：见本仓库的 [Releases](../../releases)（文件名形如 `physics-tiku-desktop-<版本>-portable.exe`）
+
+> 注：GitHub 会丢弃资产名中的中文，因此 Releases 里的文件名是英文；下载下来后可自行改名，不影响使用。
 
 ## 目录说明
 
