@@ -11,11 +11,15 @@
 const path = require('node:path')
 const fs = require('node:fs')
 const http = require('node:http')
+const https = require('node:https')
 const { spawn } = require('node:child_process')
 const { app, BrowserWindow, Menu, ipcMain, shell, session } = require('electron')
 
-/** 线上站点（窗口 origin 必须与此一致，避免 CORS） */
-const APP_URL = 'https://physics-tiku-42021.app.workbuddy.host/'
+/** 线上站点候选（启动时自动选择线上版本最新的一个，避免单一发布环境故障导致桌面版停更） */
+const OFFICIAL_URL = 'https://physics-tiku-42021.app.workbuddy.host/'
+const MIRROR_URL = 'https://lqlxhwjm1129-ops.github.io/physics-tiku/'
+/** 实际加载的线上地址（resolveAppUrl 完成后确定；窗口 origin 必须与其一致，避免 CORS） */
+let appUrl = OFFICIAL_URL
 /** 持久化分区（保登录态） */
 const PARTITION = 'persist:physics-tiku'
 const OFFLINE_PAGE = path.join(__dirname, 'resources', 'offline.html')
@@ -43,6 +47,73 @@ let mainWindow = null
 let quitting = false
 /** 本次启动是否由本程序拉起过 MinerU（用于日志/兜底判断） */
 let mineruStartedByUs = false
+
+// 桌面版可能加载 GitHub Pages 镜像（HTTPS 页面访问本机 127.0.0.1 的 MinerU 时，
+// Chromium 的「私有网络访问（PNA）」预检可能拦截本机回环请求，这里显式关闭该拦截）
+app.commandLine.appendSwitch(
+  'disable-features',
+  'BlockInsecurePrivateNetworkRequests,BlockInsecurePrivateNetworkRequestsForNavigations,PrivateNetworkAccessRespectPreflightResults',
+)
+
+/** 拉取远端文本（带超时；任何异常都按空串返回，绝不阻塞启动） */
+function fetchRemoteText(url, timeoutMs = 6000) {
+  return new Promise((resolve) => {
+    let settled = false
+    const finish = (v) => {
+      if (!settled) {
+        settled = true
+        resolve(v)
+      }
+    }
+    try {
+      const req = https.get(url, (res) => {
+        if (res.statusCode !== 200) {
+          res.resume()
+          finish('')
+          return
+        }
+        let data = ''
+        res.setEncoding('utf8')
+        res.on('data', (chunk) => {
+          data += chunk
+          if (data.length > 8192) req.destroy()
+        })
+        res.on('end', () => finish(data))
+        res.on('aborted', () => finish(data))
+      })
+      req.on('error', () => finish(''))
+      req.setTimeout(timeoutMs, () => {
+        req.destroy()
+        finish('')
+      })
+    } catch {
+      finish('')
+    }
+  })
+}
+
+/** 读取某线上地址的版本号（version.json 为 "YYYY.MM.DD-HHmm"；读不到返回空串） */
+async function readRemoteVersion(baseUrl) {
+  const text = await fetchRemoteText(baseUrl + 'version.json')
+  const m = text.match(/"version"\s*:\s*"(\d{4}\.\d{2}\.\d{2}-\d{4})"/)
+  return m ? m[1] : ''
+}
+
+/**
+ * 启动时对比官方地址与 GitHub Pages 镜像的线上版本号，加载最新的那个：
+ * - 两者版本相同（或镜像读不到）→ 官方地址（零 CORS、直连后端）；
+ * - 官方环境故障/停更、镜像更新 → 自动落到镜像（前端在 github.io 域下会自动走 Worker 代理登录）。
+ */
+async function resolveAppUrl() {
+  const [officialV, mirrorV] = await Promise.all([readRemoteVersion(OFFICIAL_URL), readRemoteVersion(MIRROR_URL)])
+  if (mirrorV && (!officialV || mirrorV > officialV)) {
+    appUrl = MIRROR_URL
+  } else {
+    appUrl = OFFICIAL_URL
+  }
+  // eslint-disable-next-line no-console
+  console.log(`线上地址选择：${appUrl}（官方 ${officialV || '?'} / 镜像 ${mirrorV || '?'}）`)
+}
 
 /** 本地答案搜索 API（127.0.0.1:8765），由渲染进程注册搜索回调后提供服务 */
 const API_PORT = Number.parseInt(process.env.TIKU_API_PORT || '8765', 10)
@@ -172,6 +243,8 @@ if (!gotLock) {
     void ensureMineru()
     // 清理 HTTP 磁盘缓存，避免线上更新后桌面版仍请求旧版 JS chunk（不清 localStorage/cookies，登录态保留）
     await session.fromPartition(PARTITION).clearCache()
+    // 选择线上版本最新的地址（官方环境故障时自动落到 GitHub Pages 镜像）
+    await resolveAppUrl()
     createWindow()
     startLocalApiServer()
 
@@ -228,7 +301,7 @@ function createWindow() {
   mainWindow.webContents.on('will-navigate', (event, url) => {
     try {
       const target = new URL(url)
-      const base = new URL(APP_URL)
+      const base = new URL(appUrl)
       if (target.origin !== base.origin) {
         event.preventDefault()
         void shell.openExternal(url)
@@ -241,12 +314,12 @@ function createWindow() {
   // 主框架加载失败 → 本地离线兜底页（错误码 -3 为用户主动取消，不处理）
   mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
     if (isMainFrame && errorCode !== -3) {
-      const query = { url: validatedURL || APP_URL, code: String(errorCode), desc: errorDescription || '' }
+      const query = { url: validatedURL || appUrl, code: String(errorCode), desc: errorDescription || '' }
       void mainWindow?.loadFile(OFFLINE_PAGE, { query })
     }
   })
 
-  void mainWindow.loadURL(APP_URL)
+  void mainWindow.loadURL(appUrl)
 
   mainWindow.on('closed', () => {
     mainWindow = null

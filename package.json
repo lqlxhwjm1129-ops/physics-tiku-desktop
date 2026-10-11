@@ -1,7 +1,7 @@
 {
   "name": "physics-tiku-desktop",
   "private": true,
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "物理题库桌面版（Electron，联网使用云端；远程加载线上地址）",
   "main": "main.js",
   "author": "physics-tiku",
