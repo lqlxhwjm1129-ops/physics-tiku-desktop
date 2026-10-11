@@ -44,6 +44,115 @@ let quitting = false
 /** 本次启动是否由本程序拉起过 MinerU（用于日志/兜底判断） */
 let mineruStartedByUs = false
 
+/** 本地答案搜索 API（127.0.0.1:8765），由渲染进程注册搜索回调后提供服务 */
+const API_PORT = Number.parseInt(process.env.TIKU_API_PORT || '8765', 10)
+const API_HOST = '127.0.0.1'
+const API_TIMEOUT_MS = 15000
+
+function setCorsHeaders(res) {
+  res.setHeader('Access-Control-Allow-Origin', '*')
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+}
+
+function sendJson(res, status, payload) {
+  const body = JSON.stringify(payload)
+  setCorsHeaders(res)
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(body, 'utf8'),
+  })
+  res.end(body)
+}
+
+function parseQuery(url) {
+  const u = new URL(url, `http://${API_HOST}:${API_PORT}`)
+  return {
+    text: u.searchParams.get('text') || '',
+    limit: Math.min(50, Math.max(1, Number(u.searchParams.get('limit')) || 10)),
+  }
+}
+
+async function searchAnswersViaRenderer(params) {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    throw new Error('窗口未就绪')
+  }
+  const expr = `Promise.resolve(window.__tikuApiSearch ? window.__tikuApiSearch(${JSON.stringify(params)}) : null)`
+  const result = await mainWindow.webContents.executeJavaScript(expr, false)
+  if (!result) throw new Error('前端未注册搜索接口：请先登录并等待页面加载完成')
+  return result
+}
+
+function startLocalApiServer() {
+  const server = http.createServer(async (req, res) => {
+    try {
+      if (req.method === 'OPTIONS') {
+        setCorsHeaders(res)
+        res.writeHead(204)
+        res.end()
+        return
+      }
+
+      const pathname = new URL(req.url || '/', `http://${API_HOST}:${API_PORT}`).pathname
+      if (pathname === '/api/health') {
+        sendJson(res, 200, { ok: true, status: 'ok', app: 'physics-tiku-desktop', version: app.getVersion() })
+        return
+      }
+
+      if (pathname === '/api/answer' || pathname === '/api/answer/search') {
+        if (req.method !== 'GET' && req.method !== 'POST') {
+          sendJson(res, 405, { ok: false, error: '仅支持 GET/POST/OPTIONS' })
+          return
+        }
+        let params
+        if (req.method === 'POST') {
+          let body = ''
+          for await (const chunk of req) body += chunk
+          try {
+            params = JSON.parse(body || '{}')
+          } catch {
+            params = {}
+          }
+        } else {
+          params = parseQuery(req.url || '')
+        }
+        if (!params.text || String(params.text).trim().length === 0) {
+          sendJson(res, 400, { ok: false, error: '缺少查询参数 text' })
+          return
+        }
+        const result = await Promise.race([
+          searchAnswersViaRenderer(params),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('搜索超时')), API_TIMEOUT_MS)),
+        ])
+        sendJson(res, result && result.ok ? 200 : 400, result ?? { ok: false, error: '搜索无结果' })
+        return
+      }
+
+      sendJson(res, 404, { ok: false, error: '接口不存在' })
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : '未知错误'
+      sendJson(res, 500, { ok: false, error: msg })
+    }
+  })
+
+  server.on('error', (e) => {
+    // 端口被占用时静默，不影响主窗口使用
+    if (e.code === 'EADDRINUSE') {
+      // eslint-disable-next-line no-console
+      console.log(`本地 API 端口 ${API_PORT} 已被占用，跳过启动`)
+    }
+  })
+
+  try {
+    server.listen(API_PORT, API_HOST, () => {
+      // eslint-disable-next-line no-console
+      console.log(`本地答案搜索 API 已启动：http://${API_HOST}:${API_PORT}`)
+    })
+  } catch {
+    // ignore
+  }
+}
+
 // 单实例锁：已在运行则聚焦已有窗口并退出本次启动
 const gotLock = app.requestSingleInstanceLock()
 if (!gotLock) {
@@ -64,6 +173,7 @@ if (!gotLock) {
     // 清理 HTTP 磁盘缓存，避免线上更新后桌面版仍请求旧版 JS chunk（不清 localStorage/cookies，登录态保留）
     await session.fromPartition(PARTITION).clearCache()
     createWindow()
+    startLocalApiServer()
 
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow()
