@@ -1,0 +1,51 @@
+{
+  "name": "physics-tiku-desktop",
+  "private": true,
+  "version": "2.0.0",
+  "description": "物理题库桌面版（Electron，联网使用云端；远程加载线上地址）",
+  "main": "main.js",
+  "author": "physics-tiku",
+  "scripts": {
+    "dev": "electron .",
+    "start": "electron .",
+    "dist:win": "electron-builder --win",
+    "dist:dir": "electron-builder --win --dir",
+    "postinstall": "electron-builder install-app-deps"
+  },
+  "devDependencies": {
+    "electron": "^31.3.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.physics.tiku.desktop",
+    "productName": "物理题库",
+    "electronDist": "node_modules/electron/dist",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "resources/**/*"
+    ],
+    "win": {
+      "target": [
+        "portable",
+        "nsis"
+      ],
+      "icon": "build/icon.ico",
+      "artifactName": "物理题库-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "物理题库"
+    },
+    "portable": {
+      "artifactName": "物理题库-${version}-便携版.${ext}"
+    }
+  }
+}

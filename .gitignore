@@ -1,0 +1,13 @@
+# 依赖
+node_modules/
+
+# electron-builder 构建产物
+release/
+dist/
+out/
+
+# 日志与临时文件
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
