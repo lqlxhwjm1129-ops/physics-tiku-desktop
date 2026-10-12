@@ -119,6 +119,10 @@ async function resolveAppUrl() {
 const API_PORT = Number.parseInt(process.env.TIKU_API_PORT || '8765', 10)
 const API_HOST = '127.0.0.1'
 const API_TIMEOUT_MS = 15000
+/** 自定义 AI 接口转发超时（模型推理可能较慢） */
+const LLM_TIMEOUT_MS = 90000
+/** 请求体上限（防止异常大请求打爆内存） */
+const MAX_BODY_BYTES = 4 * 1024 * 1024
 
 function setCorsHeaders(res) {
   res.setHeader('Access-Control-Allow-Origin', '*')
@@ -152,6 +156,101 @@ async function searchAnswersViaRenderer(params) {
   const result = await mainWindow.webContents.executeJavaScript(expr, false)
   if (!result) throw new Error('前端未注册搜索接口：请先登录并等待页面加载完成')
   return result
+}
+
+/** 读取请求体（带体积上限），返回解析后的 JSON 对象 */
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let size = 0
+    const chunks = []
+    req.on('data', (chunk) => {
+      size += chunk.length
+      if (size > MAX_BODY_BYTES) {
+        reject(new Error('请求体过大'))
+        req.destroy()
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => {
+      try {
+        const raw = Buffer.concat(chunks).toString('utf8')
+        resolve(raw ? JSON.parse(raw) : {})
+      } catch {
+        reject(new Error('请求体不是合法 JSON'))
+      }
+    })
+    req.on('error', (e) => reject(e))
+  })
+}
+
+/**
+ * 把「自定义 AI 接口」的 chat 请求放到主进程发出（Node 无浏览器 CORS 限制）。
+ * 上游统一用非流式请求，返回完整文本给渲染进程 —— 界面上的按钮本来就是等整段结果。
+ */
+function forwardLlmRequest({ baseUrl, apiKey, model, messages }) {
+  return new Promise((resolve, reject) => {
+    let target
+    try {
+      target = new URL(String(baseUrl))
+    } catch {
+      reject(new Error('接口地址无效'))
+      return
+    }
+    if (target.protocol !== 'https:' && target.protocol !== 'http:') {
+      reject(new Error('仅支持 http/https 接口'))
+      return
+    }
+    if (!model || !Array.isArray(messages) || messages.length === 0) {
+      reject(new Error('缺少 model 或 messages'))
+      return
+    }
+
+    const payload = JSON.stringify({ model: String(model), messages, stream: false })
+    const transport = target.protocol === 'https:' ? https : http
+    const key = typeof apiKey === 'string' ? apiKey.trim() : ''
+
+    const req = transport.request(
+      target,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(payload),
+          ...(key ? { Authorization: `Bearer ${key}` } : {}),
+        },
+      },
+      (res) => {
+        let data = ''
+        res.setEncoding('utf8')
+        res.on('data', (c) => {
+          data += c
+          if (data.length > 4 * 1024 * 1024) req.destroy(new Error('接口返回内容过大'))
+        })
+        res.on('end', () => {
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            reject(new Error(`接口返回 ${res.statusCode}：${data.slice(0, 300)}`))
+            return
+          }
+          try {
+            const parsed = JSON.parse(data)
+            const content =
+              parsed?.choices?.[0]?.message?.content ?? parsed?.choices?.[0]?.text ?? parsed?.output_text ?? ''
+            if (typeof content === 'string' && content.trim()) resolve(content)
+            else reject(new Error('接口未返回文本内容'))
+          } catch {
+            if (data.trim()) resolve(data.trim())
+            else reject(new Error('接口返回内容无法解析'))
+          }
+        })
+        res.on('error', (e) => reject(e))
+      },
+    )
+    req.on('error', (e) => reject(e))
+    req.setTimeout(LLM_TIMEOUT_MS, () => req.destroy(new Error('接口请求超时')))
+    req.write(payload)
+    req.end()
+  })
 }
 
 function startLocalApiServer() {
@@ -196,6 +295,20 @@ function startLocalApiServer() {
           new Promise((_, reject) => setTimeout(() => reject(new Error('搜索超时')), API_TIMEOUT_MS)),
         ])
         sendJson(res, result && result.ok ? 200 : 400, result ?? { ok: false, error: '搜索无结果' })
+        return
+      }
+
+      if (pathname === '/api/llm') {
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { ok: false, error: '仅支持 POST' })
+          return
+        }
+        const body = await readJsonBody(req)
+        const text = await Promise.race([
+          forwardLlmRequest(body || {}),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('接口请求超时')), LLM_TIMEOUT_MS + 5000)),
+        ])
+        sendJson(res, 200, { ok: true, text })
         return
       }
 
