@@ -15,11 +15,44 @@ const https = require('node:https')
 const { spawn } = require('node:child_process')
 const { app, BrowserWindow, Menu, ipcMain, shell, session } = require('electron')
 
-/** 线上站点候选（启动时自动选择线上版本最新的一个，避免单一发布环境故障导致桌面版停更） */
+/** 线上站点候选（仅远程模式使用；启动时选版本最新的一个，避免单一发布环境故障导致桌面版停更） */
 const OFFICIAL_URL = 'https://physics-tiku-42021.app.workbuddy.host/'
 const MIRROR_URL = 'https://lqlxhwjm1129-ops.github.io/physics-tiku/'
-/** 实际加载的线上地址（resolveAppUrl 完成后确定；窗口 origin 必须与其一致，避免 CORS） */
+/** 实际加载的地址（内嵌本地页或线上页；窗口 origin 必须与其一致，避免 CORS） */
 let appUrl = OFFICIAL_URL
+
+/**
+ * 内嵌本地页面路线（默认）。
+ * 打包时 `../dist` 被复制到 `<resources>/app-dist`，启动时用本机 HTTP 服务托管它，
+ * 因此**完全不依赖 GitHub Pages 或官方发布环境**，断网也能打开界面。
+ * 端口优先 3000 —— 它在云后端 CORS 白名单内，切到「WorkBuddy 云」也能直连登录。
+ * 排障需要回到远程加载时设置环境变量 TIKU_REMOTE=1。
+ */
+const APP_DIST_DIR = path.join(__dirname, '..', 'app-dist')
+const LOCAL_PAGE_PORTS = [3000, 3001, 3002, 3003, 3005]
+const FORCE_REMOTE = process.env.TIKU_REMOTE === '1'
+
+const MIME_TYPES = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.ico': 'image/x-icon',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.ttf': 'font/ttf',
+  '.eot': 'application/vnd.ms-fontobject',
+  '.map': 'application/json; charset=utf-8',
+  '.txt': 'text/plain; charset=utf-8',
+  '.wasm': 'application/wasm',
+}
 /** 持久化分区（保登录态） */
 const PARTITION = 'persist:physics-tiku'
 const OFFLINE_PAGE = path.join(__dirname, 'resources', 'offline.html')
@@ -113,6 +146,75 @@ async function resolveAppUrl() {
   }
   // eslint-disable-next-line no-console
   console.log(`线上地址选择：${appUrl}（官方 ${officialV || '?'} / 镜像 ${mirrorV || '?'}）`)
+}
+
+/** 托管内嵌网页产物的极简静态服务器（只服务 app-dist，防止目录穿越） */
+function createStaticServer(rootDir) {
+  return http.createServer((req, res) => {
+    try {
+      const rawPath = decodeURIComponent((req.url || '/').split('?')[0])
+      let rel = rawPath.replace(/^\/+/, '')
+      if (rel === '') rel = 'index.html'
+      let filePath = path.join(rootDir, rel)
+      if (!filePath.startsWith(rootDir)) {
+        res.writeHead(403)
+        res.end('Forbidden')
+        return
+      }
+      let exists = fs.existsSync(filePath) && !fs.statSync(filePath).isDirectory()
+      if (!exists && !path.extname(rel)) {
+        // SPA 深链兜底：无扩展名的路径统一回落到 index.html
+        filePath = path.join(rootDir, 'index.html')
+        exists = fs.existsSync(filePath)
+      }
+      if (!exists) {
+        res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' })
+        res.end('Not Found')
+        return
+      }
+      const type = MIME_TYPES[path.extname(filePath).toLowerCase()] || 'application/octet-stream'
+      res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'no-cache' })
+      fs.createReadStream(filePath).pipe(res)
+    } catch {
+      res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' })
+      res.end('Server Error')
+    }
+  })
+}
+
+/**
+ * 启动内嵌页面服务，返回可用端口；产物缺失或端口全被占用时返回 null（调用方回退远程加载）。
+ */
+async function startEmbeddedPage() {
+  if (!fs.existsSync(path.join(APP_DIST_DIR, 'index.html'))) {
+    // eslint-disable-next-line no-console
+    console.log('未找到内嵌网页产物，改用远程加载')
+    return null
+  }
+  for (const port of LOCAL_PAGE_PORTS) {
+    const server = createStaticServer(APP_DIST_DIR)
+    const ok = await new Promise((resolve) => {
+      const onError = () => {
+        try {
+          server.close()
+        } catch {
+          // ignore
+        }
+        resolve(false)
+      }
+      server.once('error', onError)
+      server.listen(port, '127.0.0.1', () => {
+        server.removeListener('error', onError)
+        resolve(true)
+      })
+    })
+    if (ok) {
+      // eslint-disable-next-line no-console
+      console.log(`内嵌网页已启动：http://127.0.0.1:${port}`)
+      return port
+    }
+  }
+  return null
 }
 
 /** 本地答案搜索 API（127.0.0.1:8765），由渲染进程注册搜索回调后提供服务 */
@@ -356,8 +458,13 @@ if (!gotLock) {
     void ensureMineru()
     // 清理 HTTP 磁盘缓存，避免线上更新后桌面版仍请求旧版 JS chunk（不清 localStorage/cookies，登录态保留）
     await session.fromPartition(PARTITION).clearCache()
-    // 选择线上版本最新的地址（官方环境故障时自动落到 GitHub Pages 镜像）
-    await resolveAppUrl()
+    // 优先使用内嵌本地页面（不依赖任何线上服务、断网可用）；不可用时回退远程加载
+    const embeddedPort = FORCE_REMOTE ? null : await startEmbeddedPage()
+    if (embeddedPort) {
+      appUrl = `http://127.0.0.1:${embeddedPort}/`
+    } else {
+      await resolveAppUrl()
+    }
     createWindow()
     startLocalApiServer()
 

@@ -1,8 +1,8 @@
 {
   "name": "physics-tiku-desktop",
   "private": true,
-  "version": "2.1.3",
-  "description": "物理题库桌面版（Electron，联网使用云端；远程加载线上地址）",
+  "version": "2.2.0",
+  "description": "物理题库桌面版（Electron，内嵌本地网页；支持 WorkBuddy 云 / GitHub 仓库两种数据服务）",
   "main": "main.js",
   "author": "physics-tiku",
   "scripts": {
@@ -27,6 +27,12 @@
       "main.js",
       "preload.js",
       "resources/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "../dist",
+        "to": "app-dist"
+      }
     ],
     "win": {
       "target": [
