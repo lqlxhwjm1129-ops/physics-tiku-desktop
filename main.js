@@ -13,7 +13,7 @@ const fs = require('node:fs')
 const http = require('node:http')
 const https = require('node:https')
 const { spawn } = require('node:child_process')
-const { app, BrowserWindow, Menu, ipcMain, shell, session } = require('electron')
+const { app, BrowserWindow, Menu, ipcMain, shell, session, dialog } = require('electron')
 
 /** 线上站点候选（仅远程模式使用；启动时选版本最新的一个，避免单一发布环境故障导致桌面版停更） */
 const OFFICIAL_URL = 'https://physics-tiku-42021.app.workbuddy.host/'
@@ -73,6 +73,45 @@ const MINERU_HEALTH_URL = 'http://127.0.0.1:8000/v1/health'
 const MINERU_PORTS = [8000, 8001]
 const MINERU_AUTOSTART = process.env.MINERU_AUTOSTART !== '0'
 const MINERU_SHUTDOWN = process.env.MINERU_SHUTDOWN !== '0'
+
+/** 渲染进程日志目录（排查桌面版问题用，主进程捕获 console 并落盘） */
+const LOG_DIR = path.join(app.getPath('userData'), 'logs')
+const RENDERER_LOG = path.join(LOG_DIR, 'renderer.log')
+const RENDERER_LOG_MAX_BYTES = 5 * 1024 * 1024
+
+function ensureLogDir() {
+  try {
+    if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true })
+  } catch {
+    // ignore
+  }
+}
+
+function rotateLogIfNeeded() {
+  try {
+    if (fs.existsSync(RENDERER_LOG) && fs.statSync(RENDERER_LOG).size > RENDERER_LOG_MAX_BYTES) {
+      const backup = `${RENDERER_LOG}.1`
+      if (fs.existsSync(backup)) fs.unlinkSync(backup)
+      fs.renameSync(RENDERER_LOG, backup)
+    }
+  } catch {
+    // ignore
+  }
+}
+
+function writeRendererLog(level, message, source, line) {
+  ensureLogDir()
+  rotateLogIfNeeded()
+  const now = new Date().toISOString()
+  const levelTag = String(level).toUpperCase().padStart(7, ' ')
+  const loc = source ? `${path.basename(source)}:${line ?? 0}` : 'main'
+  const lineText = `[${now}] [${levelTag}] [${loc}] ${message}\n`
+  try {
+    fs.appendFileSync(RENDERER_LOG, lineText, 'utf8')
+  } catch {
+    // ignore
+  }
+}
 
 /** @type {BrowserWindow | null} */
 let mainWindow = null
@@ -355,6 +394,91 @@ function forwardLlmRequest({ baseUrl, apiKey, model, messages }) {
   })
 }
 
+function hasVisionCapability(m) {
+  if (!m || typeof m !== 'object') return false
+  if (m.capabilities && typeof m.capabilities === 'object' && m.capabilities.vision === true) return true
+  if (m.supportsImages === true) return true
+  return false
+}
+
+/**
+ * 转发「获取模型列表」请求（OpenAI 兼容 `GET /models`），返回 { id, vision } 数组。
+ * vision 优先以接口返回的 capabilities 为准，否则按模型名推断。
+ * 与 chat 转发同理由主进程发出，绕开浏览器 CORS。
+ */
+function fetchModels({ url, apiKey }) {
+  return new Promise((resolve, reject) => {
+    let target
+    try {
+      target = new URL(String(url))
+    } catch {
+      reject(new Error('接口地址无效'))
+      return
+    }
+    if (target.protocol !== 'https:' && target.protocol !== 'http:') {
+      reject(new Error('仅支持 http/https 接口'))
+      return
+    }
+    const transport = target.protocol === 'https:' ? https : http
+    const key = typeof apiKey === 'string' ? apiKey.trim() : ''
+
+    const req = transport.request(
+      target,
+      {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+          ...(key ? { Authorization: `Bearer ${key}` } : {}),
+        },
+      },
+      (res) => {
+        let data = ''
+        res.setEncoding('utf8')
+        res.on('data', (c) => {
+          data += c
+          if (data.length > 4 * 1024 * 1024) req.destroy(new Error('接口返回内容过大'))
+        })
+        res.on('end', () => {
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            reject(new Error(`接口返回 ${res.statusCode}：${data.slice(0, 300)}`))
+            return
+          }
+          try {
+            const parsed = JSON.parse(data)
+            const list = Array.isArray(parsed?.data)
+              ? parsed.data
+              : Array.isArray(parsed?.models)
+                ? parsed.models
+                : Array.isArray(parsed)
+                  ? parsed
+                  : []
+            const models = list
+              .map((m) => {
+                if (typeof m === 'string') return { id: m, vision: false }
+                if (!m || typeof m !== 'object') return null
+                const id = m.id || m.name || m.model
+                if (typeof id !== 'string' || !id.trim()) return null
+                return { id: id.trim(), vision: hasVisionCapability(m) }
+              })
+              .filter((x) => x && typeof x.id === 'string' && x.id.length > 0)
+            if (models.length === 0) {
+              reject(new Error('接口未返回任何模型'))
+              return
+            }
+            resolve(models)
+          } catch {
+            reject(new Error('接口返回内容无法解析'))
+          }
+        })
+        res.on('error', (e) => reject(e))
+      },
+    )
+    req.on('error', (e) => reject(e))
+    req.setTimeout(LLM_TIMEOUT_MS, () => req.destroy(new Error('接口请求超时')))
+    req.end()
+  })
+}
+
 function startLocalApiServer() {
   const server = http.createServer(async (req, res) => {
     try {
@@ -411,6 +535,20 @@ function startLocalApiServer() {
           new Promise((_, reject) => setTimeout(() => reject(new Error('接口请求超时')), LLM_TIMEOUT_MS + 5000)),
         ])
         sendJson(res, 200, { ok: true, text })
+        return
+      }
+
+      if (pathname === '/api/llm/models') {
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { ok: false, error: '仅支持 POST' })
+          return
+        }
+        const body = await readJsonBody(req)
+        const models = await Promise.race([
+          fetchModels(body || {}),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('接口请求超时')), LLM_TIMEOUT_MS + 5000)),
+        ])
+        sendJson(res, 200, { ok: true, models })
         return
       }
 
@@ -531,6 +669,32 @@ function createWindow() {
     }
   })
 
+  // 捕获渲染进程 console，写入本地日志，便于排查「按 F12 打不开 DevTools」时的问题
+  mainWindow.webContents.on('console-message', (_event, level, message, line, sourceId) => {
+    writeRendererLog(level, message, sourceId, line)
+  })
+
+  // F12 / Ctrl+Shift+I / Ctrl+Shift+J 切换 DevTools（无需菜单）
+  mainWindow.webContents.on('before-input-event', (event, input) => {
+    const isDevToolsShortcut =
+      input.key === 'F12' ||
+      ((input.control || input.meta) && input.shift && (input.key.toLowerCase() === 'i' || input.key.toLowerCase() === 'j'))
+    if (isDevToolsShortcut) {
+      event.preventDefault()
+      mainWindow?.webContents.toggleDevTools()
+    }
+  })
+
+  // 渲染进程崩溃/无响应也记一笔
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    writeRendererLog('error', `渲染进程退出：${details.reason}`, 'main', 0)
+  })
+  mainWindow.on('unresponsive', () => {
+    writeRendererLog('error', '窗口无响应', 'main', 0)
+  })
+
+  writeRendererLog('info', `物理题库桌面版启动，日志路径：${RENDERER_LOG}，加载地址：${appUrl}`, 'main', 0)
+
   // 主框架加载失败 → 本地离线兜底页（错误码 -3 为用户主动取消，不处理）
   mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
     if (isMainFrame && errorCode !== -3) {
@@ -555,10 +719,56 @@ function registerIpc() {
     return undefined
   })
   ipcMain.handle('desktop:appVersion', () => app.getVersion())
+  ipcMain.handle('desktop:openDevTools', () => {
+    mainWindow?.webContents.openDevTools({ mode: 'bottom' })
+  })
   ipcMain.handle('desktop:reloadAndClearCache', async () => {
     // 只清 HTTP 磁盘缓存，不清 localStorage/cookies，登录态保留
     await session.fromPartition(PARTITION).clearCache()
     mainWindow?.reload()
+  })
+
+  /**
+   * 直接下载 PDF：用 Chromium 的打印管线把当前窗口渲染成 PDF 后写盘。
+   *
+   * 相比渲染进程 `window.print()` 的两点优势：
+   *  1. 不弹打印对话框，真正「一键保存」到磁盘；
+   *  2. 产出的是**文本型 PDF**（文字可搜索/可选中、体积小），
+   *     而不是经「Microsoft Print to PDF」之类虚拟打印机光栅化后的图片型 PDF。
+   *
+   * 版式完全复用既有打印契约：`preferCSSPageSize` 让 Chromium 采用预览页动态注入的
+   * `@page { size }`（A4/A3/B4、横竖版），`@media print` 里的隐藏非打印元素与解除
+   * 滚动容器高度限制的规则照常生效。
+   */
+  ipcMain.handle('desktop:exportPdf', async (_event, options) => {
+    const opts = options && typeof options === 'object' ? options : {}
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      return { ok: false, error: '窗口不可用' }
+    }
+    try {
+      const pdfData = await mainWindow.webContents.printToPDF({
+        printBackground: true,
+        preferCSSPageSize: opts.preferCssPageSize !== false,
+        landscape: Boolean(opts.landscape),
+      })
+
+      const defaultName =
+        typeof opts.defaultFileName === 'string' && opts.defaultFileName.trim()
+          ? opts.defaultFileName.trim()
+          : '试卷.pdf'
+
+      const { canceled, filePath } = await dialog.showSaveDialog(mainWindow, {
+        title: '保存 PDF',
+        defaultPath: path.join(app.getPath('downloads'), defaultName),
+        filters: [{ name: 'PDF 文档', extensions: ['pdf'] }],
+      })
+      if (canceled || !filePath) return { ok: false, canceled: true }
+
+      fs.writeFileSync(filePath, pdfData)
+      return { ok: true, path: filePath }
+    } catch (e) {
+      return { ok: false, error: e && e.message ? e.message : String(e) }
+    }
   })
 }
 
